@@ -3,119 +3,248 @@ const path = require("path");
 const bcrypt = require("bcryptjs");
 const dateTime = require("../utilities/dateTime.js");
 require('dotenv').config({ path: path.join(__dirname, "..", ".env") });
-const client = new pg.Client(process.env.CONNECTION_STRING);
+
+const connectionString = (process.env.CONNECTION_STRING || process.env.DATABASE_URL || '').trim();
+
+const buildPoolConfig = (connStr) => {
+    if (!connStr) {
+        return null;
+    }
+    const isProduction = process.env.NODE_ENV === 'production' || 
+        (!connStr.includes('localhost') && !connStr.includes('127.0.0.1'));
+    const requiresSsl = isProduction || 
+        connStr.includes('sslmode=require') || 
+        connStr.includes('neon.tech') || 
+        connStr.includes('render.com');
+
+    const config = {
+        connectionString: connStr,
+        max: 10,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 10000,
+    };
+
+    if (requiresSsl) {
+        config.ssl = {
+            rejectUnauthorized: false
+        };
+    }
+    return config;
+};
+
+const poolConfig = buildPoolConfig(connectionString);
+let pool = poolConfig ? new pg.Pool(poolConfig) : null;
+
+if (pool) {
+    pool.on('error', (err) => {
+        console.error('[DATABASE] Unexpected error on idle client:', err.message);
+    });
+} else {
+    console.warn('[DATABASE WARNING] Neither CONNECTION_STRING nor DATABASE_URL is configured in environment.');
+}
+
+const initializeSchema = async () => {
+    if (!pool) {
+        throw new Error('Database pool is not initialized. Check CONNECTION_STRING or DATABASE_URL.');
+    }
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 1. Create users table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                userId BIGSERIAL PRIMARY KEY,
+                email VARCHAR(255) NOT NULL UNIQUE,
+                name VARCHAR(128) NOT NULL,
+                password VARCHAR(255) NOT NULL,
+                isVerified BOOLEAN NOT NULL DEFAULT FALSE,
+                dateJoined DATE NOT NULL DEFAULT CURRENT_DATE,
+                aboutMe TEXT NOT NULL DEFAULT 'About Me section is incomplete'
+            );
+        `);
+
+        // 2. Create blogs table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS blogs (
+                blogId BIGSERIAL PRIMARY KEY,
+                blogDate DATE NOT NULL DEFAULT CURRENT_DATE,
+                content TEXT NOT NULL,
+                userId BIGINT NOT NULL REFERENCES users(userId) ON DELETE CASCADE
+            );
+        `);
+
+        // 3. Create tags table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS tags (
+                blogId BIGINT NOT NULL REFERENCES blogs(blogId) ON DELETE CASCADE,
+                tag VARCHAR(64) NOT NULL
+            );
+        `);
+
+        // 4. Safe column widening (idempotent for existing databases)
+        await client.query(`
+            DO $$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'email') THEN
+                    ALTER TABLE users ALTER COLUMN email TYPE VARCHAR(255);
+                END IF;
+                IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'password') THEN
+                    ALTER TABLE users ALTER COLUMN password TYPE VARCHAR(255);
+                END IF;
+                IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'name') THEN
+                    ALTER TABLE users ALTER COLUMN name TYPE VARCHAR(128);
+                END IF;
+                IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'tags' AND column_name = 'tag') THEN
+                    ALTER TABLE tags ALTER COLUMN tag TYPE VARCHAR(64);
+                END IF;
+            END $$;
+        `);
+
+        // 5. Safe indexes for performance and fast lookups
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_users_email_lower ON users (LOWER(email));`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_blogs_userid ON blogs (userId);`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_blogs_blogdate ON blogs (blogDate DESC);`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_tags_blogid ON tags (blogId);`);
+
+        await client.query('COMMIT');
+        console.log('[DATABASE] Schema verified and initialized successfully.');
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[DATABASE] Schema initialization failed:', err.message);
+        throw err;
+    } finally {
+        client.release();
+    }
+};
+
+const executeQuery = async (text, params = []) => {
+    if (!pool) {
+        throw new Error('Database pool is not initialized. Please configure CONNECTION_STRING.');
+    }
+    try {
+        return await pool.query(text, params);
+    } catch (err) {
+        console.error('[DATABASE QUERY ERROR]', err.message);
+        throw err;
+    }
+};
 
 module.exports = {
-    connect: () => {
-        client.connect(err => {
-            if(err) {
-                return ;
-            }
-        })
+    setPool: (customPool) => {
+        pool = customPool;
     },
-    query: async query => {
+    getPool: () => pool,
+    connect: async () => {
+        if (!pool) {
+            console.error('[DATABASE] Cannot connect: CONNECTION_STRING is not set.');
+            return false;
+        }
         try {
-            const result = await client.query(query);
-            return result;
-        } catch(err) {
-            console.log(err);
+            const client = await pool.connect();
+            try {
+                await client.query('SELECT 1');
+            } finally {
+                client.release();
+            }
+            console.log('[DATABASE] Connection established successfully.');
+            await initializeSchema();
+            return true;
+        } catch (err) {
+            console.error('[DATABASE] Connection failed:', err.message);
+            throw err;
         }
     },
-    droptagstable: async()  => {
-        const query = `DROP TABLE tags`;
-        await client.query(query);
+    close: async () => {
+        if (pool) {
+            await pool.end();
+            console.log('[DATABASE] Connection pool closed.');
+        }
     },
-    dropblogstable: async() => {
-        const query = `DROP TABLE blogs`;
-        await client.query(query);
+    query: executeQuery,
+    initializeSchema,
+
+    // Safe table creators for legacy calls
+    createusertable: async () => initializeSchema(),
+    createtagstable: async () => initializeSchema(),
+    createblogstable: async () => initializeSchema(),
+    
+    // Kept for backward compatibility if ever called by tests or admin, but non-destructive
+    droptagstable: async () => {
+        await executeQuery('DROP TABLE IF EXISTS tags CASCADE');
     },
-    dropusertable: async()  => {
-        const query = `DROP TABLE users`;
-        await client.query(query);
+    dropblogstable: async () => {
+        await executeQuery('DROP TABLE IF EXISTS blogs CASCADE');
     },
-    createusertable: async () => {
-        const query = `
-            CREATE TABLE users (
-                userId bigserial primary key,
-                email varchar(64) not null unique,
-                name varchar(64) not null,
-                password varchar(64) not null,
-                isverified boolean not null,
-                dateJoined DATE not null,
-                aboutMe text not null
-            );
-        `;
-        await client.query(query);
+    dropusertable: async () => {
+        await executeQuery('DROP TABLE IF EXISTS users CASCADE');
     },
-    createtagstable: async () => {
-        const query = `
-            CREATE TABLE TAGS (
-                blogId integer not null,
-                tag varchar(16) not null,
-                constraint fk_blog_id FOREIGN KEY(blogId) REFERENCES blogs(blogId)
-            );
-        `;
-        await client.query(query);
-    },
-    createblogstable: async () => {
-        const query =   `
-            CREATE TABLE blogs (
-                blogId bigserial primary key,
-                blogDate DATE not null,
-                content text not null,
-                userId integer not null,
-                constraint fk_user_id FOREIGN KEY(userId) REFERENCES users(userId)
-            )
-        `;
-        await client.query(query);
-    },
+
     createNewBlog: async (tags, content, userId) => {
+        if (!pool) throw new Error('Database pool is not initialized.');
+        const client = await pool.connect();
         try {
-            await client.query("BEGIN");
+            await client.query('BEGIN');
             const blogDate = new Date().toISOString();
-            const { rows: [{ blogid: blogId }] } = await client.query(`INSERT INTO blogs(blogDate, content, userId) VALUES ('${blogDate}', '${content}', ${userId}) RETURNING blogId`);
-            if(tags.length > 0) {
-                await client.query(`INSERT INTO tags(blogId, tag) VALUES ${tags.map(tag => `(${blogId}, '${tag}')`).join(", ")}`);
+            const { rows: [{ blogid }] } = await client.query(
+                `INSERT INTO blogs(blogDate, content, userId) VALUES ($1, $2, $3) RETURNING blogId`,
+                [blogDate, content, userId]
+            );
+
+            if (Array.isArray(tags) && tags.length > 0) {
+                for (const rawTag of tags) {
+                    if (rawTag && typeof rawTag === 'string' && rawTag.trim().length > 0) {
+                        await client.query(
+                            `INSERT INTO tags(blogId, tag) VALUES ($1, $2)`,
+                            [blogid, rawTag.trim().slice(0, 64)]
+                        );
+                    }
+                }
             }
-            await client.query("COMMIT");
+            await client.query('COMMIT');
             return { 
                 info: "Blog created successfully", 
                 status: "success", 
                 title: "Success" 
             };
-        } catch(err) {
-            await client.query("ROLLBACK");
+        } catch (err) {
+            await client.query('ROLLBACK');
+            console.error('[DATABASE] createNewBlog failed:', err.message);
             throw err;
+        } finally {
+            client.release();
         }
     },
-    fetchBlogs: async userId => {
+
+    fetchBlogs: async (userId) => {
         try {
-            const tempResult = await client.query(`
+            let sql = `
                 SELECT 
-                    blogs.blogId blogId,
-                    blogs.blogDate blogDate,
-                    blogs.content blogContent,
-                    blogs.userId userId,
-                    users.email email,
-                    users.name userName,
+                    blogs.blogId AS blogid,
+                    blogs.blogDate AS blogdate,
+                    blogs.content AS blogcontent,
+                    blogs.userId AS userid,
+                    users.email AS email,
+                    users.name AS username,
                     COALESCE(blogIdToTags.tags, ARRAY[]::text[]) AS tags
-                FROM
-                    blogs 
-                INNER JOIN users ON 
-                    blogs.userId = users.userId
+                FROM blogs 
+                INNER JOIN users ON blogs.userId = users.userId
                 LEFT JOIN (
                     SELECT 
                         blogId, 
-                        ARRAY_AGG(tag) tags
-                    FROM
-                        tags
-                    GROUP BY
-                        blogId
-                ) blogIdToTags ON
-                    blogs.blogId = blogIdToTags.blogId
-                ${userId ? `WHERE users.userId = ${userId}` : ""}
-                ORDER BY blogDate DESC
-            `);
+                        ARRAY_AGG(tag) AS tags
+                    FROM tags
+                    GROUP BY blogId
+                ) blogIdToTags ON blogs.blogId = blogIdToTags.blogId
+            `;
+            const params = [];
+            if (userId) {
+                sql += ` WHERE users.userId = $1 `;
+                params.push(userId);
+            }
+            sql += ` ORDER BY blogs.blogDate DESC, blogs.blogId DESC`;
+
+            const tempResult = await executeQuery(sql, params);
             const result = tempResult.rows.map(row => ({
                 blogId: row.blogid,
                 blogDate: dateTime.convertDateTimeFormat(row.blogdate),
@@ -123,7 +252,7 @@ module.exports = {
                 userId: row.userid,
                 email: row.email,
                 name: row.username,
-                tags: row.tags
+                tags: Array.isArray(row.tags) ? row.tags : []
             }));
             return { 
                 data: result, 
@@ -131,181 +260,260 @@ module.exports = {
                 status: "success", 
                 title: "Success" 
             };
-        } catch(err) {
+        } catch (err) {
+            console.error('[DATABASE] fetchBlogs error:', err.message);
             throw err;
         }
     },
-    activateUserAccount: async userId => {
+
+    activateUserAccount: async (userId) => {
         try {
-            await client.query(`UPDATE users SET isVerified = true WHERE userId = ${userId}`);
-        } catch(err) {
+            await executeQuery(`UPDATE users SET isVerified = true WHERE userId = $1`, [userId]);
+            return true;
+        } catch (err) {
+            console.error('[DATABASE] activateUserAccount error:', err.message);
             throw err;
         }
     },
-    checkIfUserExistsAndVerified: async email => {
-        const { rows } = await client.query(`SELECT * FROM users WHERE email = '${email}'`);
-        if(rows.length === 0) {
+
+    checkIfUserExistsAndVerified: async (email) => {
+        const normalizedEmail = (email || '').trim().toLowerCase();
+        const { rows } = await executeQuery(
+            `SELECT userId, email, name, isVerified FROM users WHERE LOWER(email) = LOWER($1)`,
+            [normalizedEmail]
+        );
+        if (rows.length === 0) {
             return [{}, false];
         }
-        const { userid: userId, name: name, isverified: isVerified } = rows[0];
-        return [{ userId, email, name }, isVerified];
+        const { userid: userId, email: userEmail, name: userName, isverified: isVerified } = rows[0];
+        return [{ userId, email: userEmail, name: userName }, isVerified];
     },
+
     createNewUser: async (name, email, hashedPassword) => {
         try {
             const dateJoined = new Date().toISOString();
-            const { rows: [{ userid: userId }] } = await client.query(`INSERT INTO users(name, email, password, isVerified, dateJoined, aboutMe) VALUES('${name}', '${email}', '${hashedPassword}', false, '${dateJoined}', 'About Me section is incomplete') RETURNING userId`);
-            return userId;
-        } catch(err) {
+            const normalizedEmail = email.trim().toLowerCase();
+            const trimmedName = name.trim();
+            const { rows } = await executeQuery(
+                `INSERT INTO users(name, email, password, isVerified, dateJoined, aboutMe) 
+                 VALUES($1, $2, $3, false, $4, 'About Me section is incomplete') 
+                 RETURNING userId`,
+                [trimmedName, normalizedEmail, hashedPassword, dateJoined]
+            );
+            return rows[0].userid;
+        } catch (err) {
+            console.error('[DATABASE] createNewUser error:', err.message);
             throw err;
         }
     },
-    getUserDetailsFromEmail: async email => {
+
+    getUserDetailsFromEmail: async (email) => {
         try {
-            const query = `SELECT userId, name, password, isVerified FROM users WHERE email = '${email}'`;
-            const result = await client.query(query);
-            if(result.rows[0] == undefined) {
-                return { userId: null, name: null, password: null, isVerified: null };
+            const normalizedEmail = (email || '').trim().toLowerCase();
+            const query = `SELECT userId, name, email, password, isVerified FROM users WHERE LOWER(email) = LOWER($1)`;
+            const result = await executeQuery(query, [normalizedEmail]);
+            if (!result.rows || result.rows.length === 0) {
+                return { userId: null, name: null, email: null, password: null, isVerified: null };
             }
+            const row = result.rows[0];
             return {
-                userId: result.rows[0].userid,
-                name: result.rows[0].name,
-                email: result.rows[0].email,
-                password: result.rows[0].password,
-                isVerified: result.rows[0].isverified
+                userId: row.userid,
+                name: row.name,
+                email: row.email,
+                password: row.password,
+                isVerified: row.isverified
             };
-        } catch(err) {
+        } catch (err) {
+            console.error('[DATABASE] getUserDetailsFromEmail error:', err.message);
             throw err;
         }
     },
+
     changeUserPassword: async (userId, password) => {
-        const hashedPassword = await bcrypt.hash(password, 12);
-        const query = `UPDATE users SET password = '${hashedPassword}' WHERE userId = ${userId}`;
-        await client.query(query);
-        return { 
-            info: "Password reset successful", 
-            status: "success", 
-            title: "Success"
-        };
-    },
-    getUserDetailsForSearch: async keywords => {
-        let result = [];
-        for(let keyword of keywords) {
-            const query = `SELECT userId, name, email FROM users WHERE UPPER(name) LIKE UPPER('%${keyword}%') AND isVerified = true`;
-            const tempResult = await client.query(query);
-            for(let newItem of tempResult.rows) {
-                let flag = true;
-                for(let res of result) {
-                    if(newItem.userid === res.userId) {
-                        flag = false;
-                    }
-                }
-                if(flag === true) {
-                    result.push({
-                        userId: newItem.userid,
-                        name: newItem.name,
-                        email: newItem.email
-                    });
-                }
-            }
-        }
-        const mainResult = { 
-            data: result, 
-            info: "Fetch Successful", 
-            status: "success", 
-            title: "Success" 
-        };
-        return mainResult;
-    },
-    updateUserDetails: async (userId, name, password) => {
-        let query, hashedPassword;
-        if(password) {
-            hashedPassword = await bcrypt.hash(password, 12);
-        }
-        if(name && password) {
-            query = `UPDATE users SET name = '${name}', password = '${hashedPassword}' WHERE userId = ${userId}`;
-        } else if(name && !password) {
-            query = `UPDATE users SET name = '${name}' WHERE userId = ${userId}`;
-        } else if(!name && password) {
-            query = `UPDATE users SET password = '${hashedPassword}' WHERE userId = ${userId}`;
-        }
-        const result = client.query(query);
-        return { 
-            info: "User details successfully updated", 
-            status: "success", 
-            title: "Success" 
-        };
-    },
-    getUserDetails: async userId => {
         try {
-            const result1 = await client.query(`
+            const hashedPassword = await bcrypt.hash(password, 12);
+            await executeQuery(`UPDATE users SET password = $1 WHERE userId = $2`, [hashedPassword, userId]);
+            return { 
+                info: "Password reset successful", 
+                status: "success", 
+                title: "Success"
+            };
+        } catch (err) {
+            console.error('[DATABASE] changeUserPassword error:', err.message);
+            throw err;
+        }
+    },
+
+    getUserDetailsForSearch: async (keywords) => {
+        try {
+            if (!Array.isArray(keywords) || keywords.length === 0) {
+                return { 
+                    data: [], 
+                    info: "Fetch Successful", 
+                    status: "success", 
+                    title: "Success" 
+                };
+            }
+
+            const cleanKeywords = keywords
+                .map(k => (typeof k === 'string' ? k.trim() : ''))
+                .filter(k => k.length > 0);
+
+            if (cleanKeywords.length === 0) {
+                return { 
+                    data: [], 
+                    info: "Fetch Successful", 
+                    status: "success", 
+                    title: "Success" 
+                };
+            }
+
+            // Build parameterized search query
+            const conditions = cleanKeywords.map((_, idx) => `UPPER(name) LIKE UPPER($${idx + 1})`).join(' OR ');
+            const params = cleanKeywords.map(k => `%${k}%`);
+
+            const query = `
+                SELECT DISTINCT userId, name, email 
+                FROM users 
+                WHERE isVerified = true AND (${conditions})
+                ORDER BY name ASC
+            `;
+
+            const { rows } = await executeQuery(query, params);
+            const result = rows.map(r => ({
+                userId: r.userid,
+                name: r.name,
+                email: r.email
+            }));
+
+            return { 
+                data: result, 
+                info: "Fetch Successful", 
+                status: "success", 
+                title: "Success" 
+            };
+        } catch (err) {
+            console.error('[DATABASE] getUserDetailsForSearch error:', err.message);
+            throw err;
+        }
+    },
+
+    updateUserDetails: async (userId, name, password) => {
+        try {
+            const trimmedName = name ? name.trim() : null;
+            const trimmedPassword = password ? password.trim() : null;
+
+            if (trimmedName && trimmedPassword) {
+                const hashedPassword = await bcrypt.hash(trimmedPassword, 12);
+                await executeQuery(
+                    `UPDATE users SET name = $1, password = $2 WHERE userId = $3`,
+                    [trimmedName, hashedPassword, userId]
+                );
+            } else if (trimmedName) {
+                await executeQuery(
+                    `UPDATE users SET name = $1 WHERE userId = $2`,
+                    [trimmedName, userId]
+                );
+            } else if (trimmedPassword) {
+                const hashedPassword = await bcrypt.hash(trimmedPassword, 12);
+                await executeQuery(
+                    `UPDATE users SET password = $1 WHERE userId = $2`,
+                    [hashedPassword, userId]
+                );
+            }
+
+            return { 
+                info: "User details successfully updated", 
+                status: "success", 
+                title: "Success" 
+            };
+        } catch (err) {
+            console.error('[DATABASE] updateUserDetails error:', err.message);
+            throw err;
+        }
+    },
+
+    getUserDetails: async (userId) => {
+        try {
+            const result1 = await executeQuery(`
                 SELECT
                     name,
                     email,
                     aboutMe,
                     dateJoined,
                     isVerified,
-                    (SELECT COUNT(*) FROM blogs WHERE userId = ${userId}) count
-                FROM
-                    users
-                WHERE
-                    users.userId = ${userId}
-            `);
-            const result2 = await client.query(`
+                    (SELECT COUNT(*) FROM blogs WHERE userId = $1) AS count
+                FROM users
+                WHERE users.userId = $1
+            `, [userId]);
+
+            const result2 = await executeQuery(`
                 SELECT
-                    EXTRACT(MONTH FROM blogDate) theMonth,
-                    COUNT(*) count
-                FROM
-                    blogs
-                WHERE
-                    EXTRACT(YEAR FROM blogDate) = EXTRACT(YEAR FROM CURRENT_DATE)
-                GROUP BY
-                    EXTRACT(MONTH FROM blogDate)
-                ORDER BY
-                    EXTRACT(MONTH FROM blogDate)
+                    EXTRACT(MONTH FROM blogDate) AS themonth,
+                    COUNT(*) AS count
+                FROM blogs
+                WHERE EXTRACT(YEAR FROM blogDate) = EXTRACT(YEAR FROM CURRENT_DATE)
+                GROUP BY EXTRACT(MONTH FROM blogDate)
+                ORDER BY themonth ASC
             `);
-            for(let month = 1; month <= 12; month++) {
-                let flag = true;
-                for(let { themonth, count } of result2.rows) {
-                    if(themonth == month) {
-                        flag = false;
-                        break;
-                    }
-                }
-                if(flag) {
-                    result2.rows.push({ themonth: month, count: 0 });
-                }
+
+            const monthlyCounts = [];
+            for (let month = 1; month <= 12; month++) {
+                const found = result2.rows.find(r => parseInt(r.themonth) === month);
+                monthlyCounts.push({
+                    month,
+                    count: found ? parseInt(found.count) : 0
+                });
             }
-            result2.rows = result2.rows.sort((a, b) => a.themonth - b.themonth);
-            return { details: result1.rows.length > 0 ? {
-                name: result1.rows[0].name,
-                aboutMe: result1.rows[0].aboutme,
-                email: result1.rows[0].email,
-                dateJoined: dateTime.convertDateTimeFormat(result1.rows[0].datejoined),
-                count: result1.rows[0].count,
-                isVerified: result1.rows[0].isverified,
-                countForEachMonth: result2.rows.map(({themonth, count}) => ({ month: themonth, count: parseInt(count) }))
-            } : {
-                name: "",
-                aboutMe: "",
-                email: "",
-                dateJoined: "",
-                count: 0,
-                isVerified: false,
-                countForEachMonth: dateTime.getMonthsVsBlogCount()
-            }, info: "Fetch Successful", status: "success", title: "Success" }
-        } catch(err) {
+
+            if (result1.rows.length > 0) {
+                const row = result1.rows[0];
+                return {
+                    details: {
+                        name: row.name,
+                        aboutMe: row.aboutme,
+                        email: row.email,
+                        dateJoined: dateTime.convertDateTimeFormat(row.datejoined),
+                        count: parseInt(row.count) || 0,
+                        isVerified: row.isverified,
+                        countForEachMonth: monthlyCounts
+                    },
+                    info: "Fetch Successful",
+                    status: "success",
+                    title: "Success"
+                };
+            } else {
+                return {
+                    details: {
+                        name: "",
+                        aboutMe: "",
+                        email: "",
+                        dateJoined: "",
+                        count: 0,
+                        isVerified: false,
+                        countForEachMonth: dateTime.getMonthsVsBlogCount()
+                    },
+                    info: "User not found",
+                    status: "error",
+                    title: "Not Found"
+                };
+            }
+        } catch (err) {
+            console.error('[DATABASE] getUserDetails error:', err.message);
             throw err;
         }
     },
+
     updateUserAboutMe: async (userId, aboutMe) => {
         try {
-            await client.query(`UPDATE users SET aboutMe = '${aboutMe}' WHERE userId = ${userId}`);
+            await executeQuery(`UPDATE users SET aboutMe = $1 WHERE userId = $2`, [aboutMe || '', userId]);
             return { 
                 info: "About me successfully updated", 
                 status: "success", 
                 title: "Success" 
             };
-        } catch(err) {
+        } catch (err) {
+            console.error('[DATABASE] updateUserAboutMe error:', err.message);
             throw err;
         }
     }

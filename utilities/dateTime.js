@@ -1,6 +1,8 @@
 module.exports = {
     convertDateTimeFormat: dateTime => {
+        if (!dateTime) return "";
         const inputDate = new Date(dateTime);
+        if (isNaN(inputDate.getTime())) return "";
         const day = inputDate.getDate().toString().padStart(2, "0");
         const month = (inputDate.getMonth() + 1).toString().padStart(2, "0");
         const year = inputDate.getFullYear();
@@ -21,6 +23,6 @@ module.exports = {
             { month: 10, count: 0 },
             { month: 11, count: 0 },
             { month: 12, count: 0 },
-        ]
+        ];
     }
-}
+};
